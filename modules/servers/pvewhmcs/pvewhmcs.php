@@ -123,63 +123,95 @@ function pvewhmcs_CreateAccount($params) {
 
 		$proxmox = new PVE2_API($serverip, $serverusername, "pam", $serverpassword);
 		if ($proxmox->login()) {
-            		// Get first node name.
-			$nodes = $proxmox->get_node_list();
-			$first_node = $nodes[0];
-			unset($nodes);
-			$vm_settings['newid'] = $params["serviceid"];
-			$vm_settings['name'] = "vps" . $params["serviceid"] . "-cus" . $params['clientsdetails']['userid'];
-			$vm_settings['full'] = true;
-			// KVM TEMPLATE - Conduct the VM CLONE from Template to Machine
-			$logrequest = '/nodes/' . $first_node . '/qemu/' . $params['customfields']['KVMTemplate'] . '/clone' . $vm_settings;
-			$response = $proxmox->post('/nodes/' . $first_node . '/qemu/' . $params['customfields']['KVMTemplate'] . '/clone', $vm_settings);
-			// DEBUG - Log the request parameters before it's fired
-			if (Capsule::table('mod_pvewhmcs')->where('id', '1')->value('debug_mode') == 1) {
-				logModuleCall(
-					'pvewhmcs',
-					__FUNCTION__,
-					$logrequest,
-					json_decode($response)
-				);
-			}
-			if ($response) {
-				Capsule::table('mod_pvewhmcs_vms')->insert(
-					[
-						'id' => $params['serviceid'],
-						'user_id' => $params['clientsdetails']['userid'],
-						'vtype' => 'qemu',
-						'ipaddress' => $ip->ipaddress,
-						'subnetmask' => $ip->mask,
-						'gateway' => $ip->gateway,
-						'created' => date("Y-m-d H:i:s"),
-						'v6prefix' => $plan->ipv6,
-					]
-				);
-				// ISSUE #32 relates - amend post-clone to ensure excludes-disk amendments are all done, too.
-				$cloned_tweaks['memory'] = $plan->memory;
-				$cloned_tweaks['ostype'] = $plan->ostype;
-				$cloned_tweaks['sockets'] = $plan->cpus;
-				$cloned_tweaks['cores'] = $plan->cores;
-				$cloned_tweaks['cpu'] = $plan->cpuemu;
-				$cloned_tweaks['kvm'] = $plan->kvm;
-				$cloned_tweaks['onboot'] = $plan->onboot;
-    				do {
-    					$amendment = $proxmox->post('/nodes/' . $first_node . '/qemu/' . $vm_settings['newid'] . '/config', $cloned_tweaks);
-				} while ($amendment !== true);
-				return true;
-			} else {
-				if (is_array($response) && isset($response['data']['errors'])) {
-					$response_message = json_encode($response['data']['errors']);
-				} elseif (is_string($response) || is_numeric($response)) {
-					$response_message = (string)$response;
-				} else {
-					$response_message = "Unexpected Error/Response. Type: " . gettype($response) . ", Contents: " . print_r($response, true);
-				}
-				throw new Exception("Proxmox Error: Failed to create Service. Response: " . $response_message);
-			}
-		} else {
-			throw new Exception("Proxmox Error: PVE API login failed. Please check your credentials.");
-		}
+    // Get first node name.
+    $nodes = $proxmox->get_node_list();
+    $first_node = $nodes[0];
+    unset($nodes);
+
+    $vm_settings['newid'] = $params["serviceid"];
+    $vm_settings['name'] = "vps" . $params["serviceid"] . "-cus" . $params['clientsdetails']['userid'];
+    $vm_settings['full'] = true;
+
+    // KVM TEMPLATE - Conduct the VM CLONE from Template to Machine
+    $logrequest = '/nodes/' . $first_node . '/qemu/' . $params['customfields']['KVMTemplate'] . '/clone' . $vm_settings;
+    $response = $proxmox->post('/nodes/' . $first_node . '/qemu/' . $params['customfields']['KVMTemplate'] . '/clone', $vm_settings);
+
+    // DEBUG - Log the request parameters before it's fired
+    if (Capsule::table('mod_pvewhmcs')->where('id', '1')->value('debug_mode') == 1) {
+        logModuleCall(
+            'pvewhmcs',
+            __FUNCTION__,
+            $logrequest,
+            json_decode($response)
+        );
+    }
+
+    if ($response && isset($response['data'])) {
+        // Extract the task ID (UPID) from the response to check the status later
+        $taskId = $response['data'];
+
+        // Poll the task status until cloning finishes
+        $isCloning = true;
+        while ($isCloning) {
+            // Get the task status
+            $taskStatus = $proxmox->get('/nodes/' . $first_node . '/tasks/' . $taskId . '/status');
+
+            // Check if the task has finished (either successfully or with an error)
+            if (isset($taskStatus['status']) && $taskStatus['status'] === 'stopped') {
+                // Check if the task finished successfully
+                if ($taskStatus['exitstatus'] === 'OK') {
+                    $isCloning = false;
+                } else {
+                    // Handle cloning error
+                    throw new Exception('Cloning failed: ' . $taskStatus['exitstatus']);
+                }
+            }
+
+            // Optionally sleep to avoid spamming the API too much
+            sleep(2);
+        }
+
+        // Insert VM details into the database after cloning is complete
+        Capsule::table('mod_pvewhmcs_vms')->insert(
+            [
+                'id' => $params['serviceid'],
+                'user_id' => $params['clientsdetails']['userid'],
+                'vtype' => 'qemu',
+                'ipaddress' => $ip->ipaddress,
+                'subnetmask' => $ip->mask,
+                'gateway' => $ip->gateway,
+                'created' => date("Y-m-d H:i:s"),
+                'v6prefix' => $plan->ipv6,
+            ]
+        );
+
+        // ISSUE #32 relates - amend post-clone to ensure excludes-disk amendments are all done, too.
+        $cloned_tweaks['memory'] = $plan->memory;
+        $cloned_tweaks['ostype'] = $plan->ostype;
+        $cloned_tweaks['sockets'] = $plan->cpus;
+        $cloned_tweaks['cores'] = $plan->cores;
+        $cloned_tweaks['cpu'] = $plan->cpuemu;
+        $cloned_tweaks['kvm'] = $plan->kvm;
+        $cloned_tweaks['onboot'] = $plan->onboot;
+
+        // Apply the configuration tweaks after cloning completes
+        $amendment = $proxmox->post('/nodes/' . $first_node . '/qemu/' . $vm_settings['newid'] . '/config', $cloned_tweaks);
+
+        return true;
+    } else {
+        if (is_array($response) && isset($response['data']['errors'])) {
+            $response_message = json_encode($response['data']['errors']);
+        } elseif (is_string($response) || is_numeric($response)) {
+            $response_message = (string)$response;
+        } else {
+            $response_message = "Unexpected Error/Response. Type: " . gettype($response) . ", Contents: " . print_r($response, true);
+        }
+        throw new Exception("Proxmox Error: Failed to create Service. Response: " . $response_message);
+    }
+} else {
+    throw new Exception("Proxmox Error: PVE API login failed. Please check your credentials.");
+}
+
     	// PREPARE SETTINGS FOR QEMU/LXC EVENTUALITIES
 	} else {
 		$vm_settings['vmid'] = $params["serviceid"];
